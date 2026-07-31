@@ -1,0 +1,650 @@
+# mintmcp-version: 11
+name: Run Agent
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        required: true
+        type: string
+        description: "Path to agent.yml relative to repo root"
+      environment_name:
+        required: false
+        type: string
+        default: ""
+        description: "GitHub Environment name for this agent (legacy; omit for new agents)"
+      agent_secrets_json:
+        required: false
+        type: string
+        default: "{}"
+        description: "Fallback for manual workflow_dispatch testing; generated workflows use the secrets block instead"
+      event_name:
+        required: true
+        type: string
+        description: "Original event name (repository_dispatch, workflow_dispatch, schedule)"
+      event_payload:
+        required: true
+        type: string
+        description: "JSON-serialized event payload"
+      model_override:
+        required: false
+        type: string
+        default: ""
+        description: "Explicit model override from workflow_dispatch input"
+      prompt_override:
+        required: false
+        type: string
+        default: ""
+        description: "Manual prompt from workflow_dispatch input (bypasses agent.yml prompt template)"
+      runner:
+        required: false
+        type: string
+        default: "ubuntu-latest"
+        description: "GitHub Actions runner label"
+      timeout_minutes:
+        required: false
+        type: number
+        default: 20
+        description: "Job timeout in minutes"
+    secrets:
+      AGENT_SECRETS_JSON:
+        required: false
+      SLACK_BOT_TOKEN:
+        required: false
+      SLACK_TEAM_ID:
+        required: false
+      MINTMCP_AGENT_TOKEN:
+        required: false
+      MINTMCP_ORG_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+jobs:
+  run:
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment_name || '' }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Parse config and generate files
+        id: config
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          EVENT_NAME: ${{ inputs.event_name }}
+          EVENT_PAYLOAD: ${{ inputs.event_payload }}
+          PROMPT_OVERRIDE: ${{ inputs.prompt_override }}
+          AGENT_SECRETS_JSON: ${{ secrets.AGENT_SECRETS_JSON || inputs.agent_secrets_json }}
+          # Legacy env vars — populated via secrets: inherit for old-style agents.
+          # New-style agents use AGENT_SECRETS_JSON instead; these will be empty.
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_TEAM_ID: ${{ secrets.SLACK_TEAM_ID }}
+          MINTMCP_AGENT_TOKEN: ${{ secrets.MINTMCP_AGENT_TOKEN }}
+          MINTMCP_ORG_KEY: ${{ secrets.MINTMCP_ORG_KEY }}
+        run: |
+          pip install -q pyyaml 2>/dev/null || true
+          python3 << 'PYEOF'
+          import yaml, json, os, re, sys, uuid
+          PLUGIN_REPO_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*/[a-zA-Z0-9][a-zA-Z0-9_.\-]*$')
+
+          config_path = os.environ['CONFIG_PATH']
+          event_name = os.environ['EVENT_NAME']
+          event_payload = os.environ['EVENT_PAYLOAD']
+          prompt_override = os.environ.get('PROMPT_OVERRIDE', '')
+
+          with open(config_path) as f:
+              config = yaml.safe_load(f)
+
+          # --- 0. Validate required fields ---
+          for field in ['name', 'slug', 'agent_dir']:
+              if field not in config:
+                  print(f"::error::agent.yml missing required field: {field}")
+                  sys.exit(1)
+          for sname, server in config.get('mcp_servers', {}).items():
+              if 'url' not in server and 'command' not in server:
+                  print(f"::error::MCP server '{sname}' needs 'command' (stdio) or 'url' (http)")
+                  sys.exit(1)
+
+          # --- 1. Generate /tmp/mcp-config.json ---
+          mcp_servers = config.get('mcp_servers', {})
+          mcp_config = {"mcpServers": {}}
+          for name, server in mcp_servers.items():
+              server_copy = dict(server)
+              # Infer type from fields (mirrors Zod transform in agentConfig.ts)
+              if not server_copy.get('type'):
+                  if 'command' in server_copy:
+                      server_copy['type'] = 'stdio'
+                  elif 'url' in server_copy:
+                      server_copy['type'] = 'http'
+              if server_copy.get('type') == 'stdio':
+                  server_copy.pop('type', None)
+              mcp_config["mcpServers"][name] = server_copy
+
+          mcp_json = json.dumps(mcp_config, indent=2)
+          try:
+              agent_secrets = json.loads(os.environ.get('AGENT_SECRETS_JSON', '{}'))
+          except json.JSONDecodeError as e:
+              print(f"::error::Failed to parse AGENT_SECRETS_JSON: {e}")
+              sys.exit(1)
+          secret_pattern = re.compile(r'\{\{secrets\.([A-Z_][A-Z0-9_]*)\}\}')
+
+          # Fail fast if config references a secret that is missing or empty in env.
+          referenced_secrets = sorted(set(secret_pattern.findall(mcp_json)))
+          missing_secrets = [key for key in referenced_secrets if not (agent_secrets.get(key) or os.environ.get(key))]
+          if missing_secrets:
+              for key in missing_secrets:
+                  print(f"::error::Secret '{key}' referenced in MCP config but not available. Provision it via MintMCP or GitHub repo secrets.")
+              sys.exit(1)
+
+          mcp_json = secret_pattern.sub(lambda m: agent_secrets.get(m.group(1)) or os.environ.get(m.group(1), ''), mcp_json)
+          with open('/tmp/mcp-config.json', 'w') as f:
+              f.write(mcp_json)
+
+          # --- 2. Generate /tmp/settings.json ---
+          # Load project-level .claude/settings.json as base if it exists
+          settings = {}
+          if os.path.exists('.claude/settings.json'):
+              with open('.claude/settings.json') as sf:
+                  try:
+                      settings = json.load(sf)
+                  except (json.JSONDecodeError, ValueError) as e:
+                      print(f"::warning::.claude/settings.json contains invalid JSON: {e}. Proceeding with empty settings.")
+              if not isinstance(settings, dict):
+                  print(f"::warning::.claude/settings.json is not a JSON object (got {type(settings).__name__}). Proceeding with empty settings.")
+                  settings = {}
+
+          hooks_config = config.get('hooks', {})
+          write_check = hooks_config.get('write_check', False)
+          mintmcp_monitor = hooks_config.get('mintmcp_monitor', False)
+
+          ALWAYS_DOMAINS = ['github.com', 'api.github.com', 'claude.ai', 'api.anthropic.com']
+          DEFAULT_EXTRA_DOMAINS = ['npmjs.org', 'registry.npmjs.org', 'pypi.org']
+          DEFAULT_DOMAINS = ALWAYS_DOMAINS + DEFAULT_EXTRA_DOMAINS
+
+          sandbox = config.get('sandbox', {})
+          if sandbox.get('enabled', True):
+              s = {
+                  'enabled': True,
+                  'autoAllowBashIfSandboxed': sandbox.get('auto_allow_bash_if_sandboxed', True),
+                  'allowUnsandboxedCommands': sandbox.get('allow_unsandboxed_commands', False),
+              }
+              domains = sandbox.get('allowed_domains', [])
+              if not domains:
+                  domains = list(DEFAULT_DOMAINS)
+              else:
+                  # Always include essential domains even when custom domains are specified
+                  domains = sorted(set(ALWAYS_DOMAINS + domains))
+              if mintmcp_monitor and 'app.mintmcp.com' not in domains:
+                  domains.append('app.mintmcp.com')
+              if domains:
+                  s['network'] = {'allowedDomains': domains}
+              settings['sandbox'] = s
+          else:
+              # Explicitly disabled — clear any inherited sandbox config
+              settings.pop('sandbox', None)
+
+          if write_check or mintmcp_monitor:
+              hooks = {'PreToolUse': [], 'PostToolUse': []}
+
+              bash_hooks = []
+              if write_check:
+                  bash_hooks.append({'type': 'command', 'command': 'bash scripts/agent-write-check.sh'})
+              if mintmcp_monitor:
+                  bash_hooks.append({'type': 'command', 'command': 'sh /tmp/mint.sh'})
+              if bash_hooks:
+                  hooks['PreToolUse'].append({'matcher': 'Bash', 'hooks': bash_hooks})
+
+              if mintmcp_monitor:
+                  hooks['PreToolUse'].append({
+                      'matcher': '.*',
+                      'hooks': [{'type': 'command', 'command': 'sh /tmp/mint.sh'}]
+                  })
+                  hooks['PostToolUse'].append({
+                      'matcher': '.*',
+                      'hooks': [{'type': 'command', 'command': 'sh /tmp/mint.sh'}]
+                  })
+
+              settings['hooks'] = hooks
+          else:
+              # Neither hook enabled — clear any inherited hooks
+              settings.pop('hooks', None)
+
+          permissions = config.get('permissions', [])
+          if permissions:
+              settings['permissions'] = {'allow': permissions}
+          elif 'permissions' in config:
+              # User explicitly wrote `permissions: []` in agent.yml — clear inherited
+              settings.pop('permissions', None)
+
+          if mintmcp_monitor:
+              mintmcp_user = hooks_config.get('mintmcp_user', '') or config.get('slug', '')
+              org_key = agent_secrets.get('MINTMCP_ORG_KEY') or os.environ.get('MINTMCP_ORG_KEY', '')
+              settings['env'] = {
+                  'MINTMCP_ORG_KEY': org_key,
+                  'MINTMCP_USER': mintmcp_user,
+              }
+
+          # Validate declared plugins (actual install + discovery happens in Install step)
+          plugins = config.get('plugins', [])
+          if plugins:
+              seen_repos = set()
+              for pi, p in enumerate(plugins):
+                  if not isinstance(p, dict) or 'repo' not in p or not isinstance(p['repo'], str):
+                      print(f"::error::plugins[{pi}] must be an object with a string 'repo' field.")
+                      sys.exit(1)
+                  # Coerce ref to string (YAML may parse unquoted numbers as int)
+                  if 'ref' in p and not isinstance(p['ref'], str):
+                      p['ref'] = str(p['ref'])
+                  if not PLUGIN_REPO_RE.match(p['repo']):
+                      print(f"::error::Plugin repo '{p['repo']}' must be in 'owner/repo' format (alphanumeric, hyphens, dots, underscores only).")
+                      sys.exit(1)
+                  if p['repo'] in seen_repos:
+                      print(f"::error::Duplicate plugin repo '{p['repo']}' at index {pi}.")
+                      sys.exit(1)
+                  seen_repos.add(p['repo'])
+                  p['_install_path'] = f"/tmp/plugins/{p['repo'].replace('/', '--')}"
+
+          with open('/tmp/settings.json', 'w') as f:
+              json.dump(settings, f, indent=2)
+
+          # --- 3. Create /tmp/mint.sh if needed ---
+          if mintmcp_monitor:
+              with open('/tmp/mint.sh', 'w') as f:
+                  f.write('#!/bin/sh\n')
+                  f.write('if [ -z "$MINTMCP_ORG_KEY" ]; then\n')
+                  f.write('    echo \'{"continue": true, "suppressOutput": true}\'\n')
+                  f.write('    exit 0\n')
+                  f.write('fi\n')
+                  f.write('MINTMCP_USER=${MINTMCP_USER:-$USER}\n')
+                  f.write('MINTMCP_BASE_URL=${MINTMCP_BASE_URL:-"https://app.mintmcp.com"}\n')
+                  f.write('json_input=$(cat)\n')
+                  f.write('MINTMCP_URL="$MINTMCP_BASE_URL/h/$MINTMCP_ORG_KEY,$MINTMCP_USER/claudecode"\n')
+                  f.write('curl -q -s -X POST -H "Content-Type: application/json" -d "$json_input" "$MINTMCP_URL"\n')
+                  f.write('exit 0\n')
+              os.chmod('/tmp/mint.sh', 0o755)
+
+          # --- 4. Render prompt ---
+          if prompt_override:
+              prompt = prompt_override
+          else:
+              raw_prompt = config.get('prompt', '')
+              has_placeholders = '{{event_name}}' in raw_prompt or '{{event_payload}}' in raw_prompt
+              # Legacy: substitute placeholders if present
+              prompt = raw_prompt.replace('{{event_name}}', event_name)
+              prompt = prompt.replace('{{event_payload}}', event_payload)
+              # Always append trigger context unless prompt already had placeholders
+              if not has_placeholders and event_payload and event_payload != '{}':
+                  prompt += f'\n\n## Current trigger\n\nEvent: {event_name}\nPayload:\n{event_payload}'
+
+          # Append git commit guidance for agents with a state directory
+          agent_dir = config.get('agent_dir', '')
+          if agent_dir:
+              prompt += (
+                  f'\n\n## Git commit guidance\n\n'
+                  f'After your session ends, the workflow automatically commits only '
+                  f'`{agent_dir}/progress.md`, `{agent_dir}/activity-log.csv`, '
+                  f'and files in `{agent_dir}/inbound/`. '
+                  f'Any other file changes (including other files inside `{agent_dir}/`) '
+                  f'must be committed and pushed by you during your session.'
+              )
+
+          with open('/tmp/agent-prompt.txt', 'w') as f:
+              f.write(prompt)
+
+          # --- 5. Write step outputs ---
+          runtime = config.get('runtime', {})
+          allowed_tools = ','.join(config.get('allowed_tools', []))
+          mintmcp_user = hooks_config.get('mintmcp_user', '') or config.get('slug', '')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"slug={config.get('slug', '')}\n")
+              f.write(f"name={config.get('name', '')}\n")
+              f.write(f"agent_dir={config.get('agent_dir', '')}\n")
+              f.write(f"allowed_tools={allowed_tools}\n")
+              f.write(f"model={runtime.get('model', 'sonnet')}\n")
+              f.write(f"default_model={runtime.get('default_model', 'sonnet')}\n")
+              f.write(f"max_turns={runtime.get('max_turns', '')}\n")
+              f.write(f"mintmcp_user={mintmcp_user}\n")
+              codex_raw = config.get('codex')
+              codex = codex_raw if isinstance(codex_raw, dict) else {}
+              codex_enabled = codex.get('enabled') is True
+              f.write(f"has_codex={'true' if codex_enabled else 'false'}\n")
+              f.write(f"has_plugins={'true' if plugins else 'false'}\n")
+              plugins_delim = f"PLUGINS_{uuid.uuid4().hex[:12]}"
+              f.write(f"plugins_json<<{plugins_delim}\n")
+              f.write(json.dumps(plugins))
+              f.write(f"\n{plugins_delim}\n")
+              f.write("prompt<<PROMPT_DELIMITER\n")
+              f.write(prompt)
+              if not prompt.endswith('\n'):
+                  f.write('\n')
+              f.write("PROMPT_DELIMITER\n")
+
+          print(f"Config parsed: {config.get('name')} ({config.get('slug')})")
+          print(f"  MCP servers: {', '.join(mcp_servers.keys())}")
+          print(f"  Write check: {write_check}, MintMCP monitor: {mintmcp_monitor}")
+          print(f"  Model: {runtime.get('model')}, Max turns: {runtime.get('max_turns')}")
+          PYEOF
+
+      - name: Install plugins
+        id: plugins
+        if: steps.config.outputs.has_plugins == 'true'
+        env:
+          PLUGINS_JSON: ${{ steps.config.outputs.plugins_json }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AGENT_SECRETS_JSON: ${{ secrets.AGENT_SECRETS_JSON || inputs.agent_secrets_json }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, shlex, shutil, subprocess, sys
+
+          try:
+              plugins = json.loads(os.environ['PLUGINS_JSON'])
+          except (json.JSONDecodeError, KeyError) as e:
+              print(f"::error::Failed to parse PLUGINS_JSON: {e}")
+              sys.exit(1)
+          if not isinstance(plugins, list):
+              print(f"::error::PLUGINS_JSON must be a JSON array, got {type(plugins).__name__}")
+              sys.exit(1)
+
+          default_token = os.environ.get('GITHUB_TOKEN', '')
+          try:
+              agent_secrets = json.loads(os.environ.get('AGENT_SECRETS_JSON', '{}'))
+          except json.JSONDecodeError as e:
+              print(f"::error::Failed to parse AGENT_SECRETS_JSON: {e}")
+              sys.exit(1)
+          if not isinstance(agent_secrets, dict):
+              print(f"::error::AGENT_SECRETS_JSON must be a JSON object, got {type(agent_secrets).__name__}")
+              sys.exit(1)
+
+          os.makedirs('/tmp/plugins', exist_ok=True)
+
+          # Build a clean env for subprocesses (exclude secrets)
+          clean_env = {k: v for k, v in os.environ.items()
+                       if k not in ('AGENT_SECRETS_JSON', 'GITHUB_TOKEN', 'PLUGINS_JSON')}
+
+          # Collect resolved plugin directories for --plugin-dir flags
+          plugin_dirs = []
+
+          for i, plugin in enumerate(plugins):
+              if not isinstance(plugin, dict) or 'repo' not in plugin:
+                  print(f"::error::Plugin entry at index {i} is invalid: must be an object with a 'repo' field.")
+                  sys.exit(1)
+              repo = plugin['repo']
+              ref = str(plugin.get('ref', ''))
+              if ref and ref.startswith('-'):
+                  print(f"::error::Plugin '{repo}' ref '{ref}' must not start with '-'.")
+                  sys.exit(1)
+              if '_install_path' not in plugin:
+                  print(f"::error::Plugin entry at index {i} is missing '_install_path'. This is a bug in the config step.")
+                  sys.exit(1)
+              install_path = plugin['_install_path']
+
+              # Resolve auth token
+              token_secret = plugin.get('token_secret', '')
+              if token_secret:
+                  token = agent_secrets.get(token_secret, '')
+                  if not token:
+                      print(f"::error::Plugin '{repo}' declares token_secret '{token_secret}' but it is empty or missing.")
+                      sys.exit(1)
+              else:
+                  token = default_token
+              if not token:
+                  print(f"::error::No authentication token available for plugin '{repo}'.")
+                  sys.exit(1)
+
+              # Mask token so it doesn't appear in logs
+              print(f"::add-mask::{token}")
+
+              clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+              cmd = ['git', 'clone', '--depth', '1']
+              if ref:
+                  cmd += ['--branch', ref]
+              cmd += [clone_url, install_path]
+              try:
+                  subprocess.run(cmd, check=True, env=clean_env)
+              except subprocess.CalledProcessError as e:
+                  ref_msg = f" (ref: {ref})" if ref else ""
+                  print(f"::error::Failed to clone plugin '{repo}'{ref_msg}. Exit code: {e.returncode}. Check that the repo exists and the token has access.")
+                  sys.exit(1)
+
+              # Remove token from .git/config to prevent leakage
+              scrub = subprocess.run(
+                  ['git', 'remote', 'set-url', 'origin', f"https://github.com/{repo}.git"],
+                  cwd=install_path, check=False, env=clean_env)
+              if scrub.returncode != 0:
+                  print(f"::warning::Failed to scrub token from .git/config for plugin '{repo}'. Removing .git directory.")
+                  shutil.rmtree(f"{install_path}/.git", ignore_errors=True)
+
+              # Auto-detect and run install command
+              install_cmd = plugin.get('install_command', '')
+              if not install_cmd:
+                  if os.path.exists(f"{install_path}/package.json"):
+                      install_cmd = 'npm install --omit=dev'
+                  elif os.path.exists(f"{install_path}/requirements.txt"):
+                      install_cmd = 'pip install -r requirements.txt'
+              if install_cmd:
+                  try:
+                      cmd_parts = shlex.split(install_cmd)
+                  except ValueError as e:
+                      print(f"::error::Plugin '{repo}' install_command has invalid shell quoting: {e}")
+                      sys.exit(1)
+                  try:
+                      subprocess.run(cmd_parts, cwd=install_path, check=True, env=clean_env)
+                  except subprocess.CalledProcessError as e:
+                      print(f"::error::Plugin '{repo}' install command failed (exit code {e.returncode}): {install_cmd}")
+                      sys.exit(1)
+
+              # Discover individual plugin directories.
+              # A repo can be a marketplace (with .claude-plugin/marketplace.json listing sub-plugins)
+              # or a single plugin (with commands/, skills/, or .claude-plugin/plugin.json at root).
+              marketplace_path = os.path.join(install_path, '.claude-plugin', 'marketplace.json')
+              if os.path.exists(marketplace_path):
+                  try:
+                      with open(marketplace_path) as mf:
+                          marketplace = json.load(mf)
+                      for mp in marketplace.get('plugins', []):
+                          source = mp.get('source', '')
+                          if not source:
+                              continue
+                          sub_dir = os.path.normpath(os.path.join(install_path, source))
+                          if not sub_dir.startswith(install_path):
+                              print(f"::warning::Plugin '{repo}' marketplace source '{source}' escapes install directory. Skipping.")
+                              continue
+                          if os.path.isdir(sub_dir):
+                              plugin_dirs.append(sub_dir)
+                              print(f"  Discovered sub-plugin: {mp.get('name', source)} -> {sub_dir}")
+                          else:
+                              print(f"::warning::Plugin '{repo}' marketplace source '{source}' not found at {sub_dir}")
+                  except (json.JSONDecodeError, ValueError) as e:
+                      print(f"::warning::Plugin '{repo}' has invalid marketplace.json: {e}. Treating as single plugin.")
+                      plugin_dirs.append(install_path)
+              else:
+                  # Single plugin repo — the root is the plugin directory
+                  plugin_dirs.append(install_path)
+
+              print(f"Installed plugin: {repo} -> {install_path}")
+
+          # Write plugin_dir_args as step output — one "--plugin-dir /path" per line
+          # so it can be spliced directly into claude_args (which is multiline)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              dirs_delim = f"PLUGIN_DIRS_{os.urandom(6).hex()}"
+              f.write(f"plugin_dir_args<<{dirs_delim}\n")
+              for d in plugin_dirs:
+                  f.write(f"--plugin-dir {d}\n")
+              f.write(f"{dirs_delim}\n")
+          print(f"Plugin directories: {plugin_dirs}")
+          PYEOF
+
+      - name: Install Codex CLI
+        if: steps.config.outputs.has_codex == 'true'
+        env:
+          AGENT_SECRETS_JSON: ${{ secrets.AGENT_SECRETS_JSON || inputs.agent_secrets_json }}
+        run: |
+          # ubuntu-latest already has Node.js; just install Codex CLI globally
+          npm install -g @openai/codex@0.134.0
+
+          # Setup auth from agent secret
+          python3 << 'PYEOF'
+          import json, os, sys
+
+          try:
+              agent_secrets = json.loads(os.environ.get('AGENT_SECRETS_JSON', '{}'))
+          except json.JSONDecodeError as e:
+              print(f"::error::Failed to parse AGENT_SECRETS_JSON: {e}")
+              sys.exit(1)
+
+          auth_json = agent_secrets.get('CODEX_AUTH_JSON', '')
+          if not auth_json:
+              print("::error::Codex is enabled but CODEX_AUTH_JSON secret is empty or missing.")
+              sys.exit(1)
+
+          # Validate it is valid JSON
+          try:
+              parsed_auth = json.loads(auth_json)
+          except json.JSONDecodeError as e:
+              print(f"::error::CODEX_AUTH_JSON is not valid JSON: {e}")
+              sys.exit(1)
+
+          # Compact to single line for reliable masking (multi-line breaks ::add-mask::)
+          auth_json = json.dumps(parsed_auth, separators=(',', ':'))
+          print(f"::add-mask::{auth_json}")
+          # Also mask individual string values so partial leaks are caught
+          for val in parsed_auth.values():
+              if isinstance(val, str) and len(val) >= 4:
+                  print(f"::add-mask::{val}")
+
+          # Write auth.json
+          os.makedirs(os.path.expanduser('~/.codex'), exist_ok=True)
+          auth_path = os.path.expanduser('~/.codex/auth.json')
+          with open(auth_path, 'w') as f:
+              f.write(auth_json)
+          os.chmod(auth_path, 0o600)
+          print(f"Codex auth configured at {auth_path}")
+          PYEOF
+
+      - name: Detect model
+        id: detect-model
+        env:
+          MODEL_CONFIG: ${{ steps.config.outputs.model }}
+          MODEL_OVERRIDE: ${{ inputs.model_override }}
+          DEFAULT_MODEL: ${{ steps.config.outputs.default_model }}
+          EVENT_PAYLOAD: ${{ inputs.event_payload }}
+        run: |
+          if [ -n "$MODEL_OVERRIDE" ]; then
+            echo "model=$MODEL_OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "Model: $MODEL_OVERRIDE (override)"
+          elif [ "$MODEL_CONFIG" = "auto-detect" ]; then
+            PAYLOAD_LOWER=$(echo "$EVENT_PAYLOAD" | tr '[:upper:]' '[:lower:]')
+            if [[ "$PAYLOAD_LOWER" == *"opus"* ]]; then
+              echo "model=opus" >> "$GITHUB_OUTPUT"
+              echo "Model: opus (auto-detected)"
+            elif [[ "$PAYLOAD_LOWER" == *"haiku"* ]]; then
+              echo "model=haiku" >> "$GITHUB_OUTPUT"
+              echo "Model: haiku (auto-detected)"
+            elif [[ "$PAYLOAD_LOWER" == *"fable"* ]]; then
+              echo "model=fable" >> "$GITHUB_OUTPUT"
+              echo "Model: fable (auto-detected)"
+            else
+              echo "model=$DEFAULT_MODEL" >> "$GITHUB_OUTPUT"
+              echo "Model: $DEFAULT_MODEL (default)"
+            fi
+          else
+            echo "model=$MODEL_CONFIG" >> "$GITHUB_OUTPUT"
+            echo "Model: $MODEL_CONFIG (fixed)"
+          fi
+
+      - name: Resolve agent secrets
+        id: resolve-secrets
+        env:
+          AGENT_SECRETS_JSON: ${{ secrets.AGENT_SECRETS_JSON || inputs.agent_secrets_json }}
+          FALLBACK_ORG_KEY: ${{ secrets.MINTMCP_ORG_KEY }}
+          FALLBACK_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python3 -c "
+          import json, os
+          s = json.loads(os.environ.get('AGENT_SECRETS_JSON', '{}'))
+          org_key = s.get('MINTMCP_ORG_KEY') or os.environ.get('FALLBACK_ORG_KEY', '')
+          oauth = s.get('CLAUDE_CODE_OAUTH_TOKEN') or os.environ.get('FALLBACK_OAUTH_TOKEN', '')
+          if org_key:
+              print(f'::add-mask::{org_key}')
+          if oauth:
+              print(f'::add-mask::{oauth}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'mintmcp_org_key={org_key}\n')
+              f.write(f'claude_code_oauth_token={oauth}\n')
+          "
+
+      - name: Run agent
+        id: agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          MINTMCP_ORG_KEY: ${{ steps.resolve-secrets.outputs.mintmcp_org_key }}
+          MINTMCP_USER: ${{ steps.config.outputs.mintmcp_user }}
+          AGENT_NAME: ${{ steps.config.outputs.name }}
+          AGENT_DIR: ${{ steps.config.outputs.agent_dir }}
+        with:
+          allowed_bots: '*'
+          claude_code_oauth_token: ${{ steps.resolve-secrets.outputs.claude_code_oauth_token }}
+          prompt: ${{ steps.config.outputs.prompt }}
+          claude_args: |
+            --model ${{ steps.detect-model.outputs.model }}
+            ${{ steps.config.outputs.max_turns != '' && format('--max-turns {0}', steps.config.outputs.max_turns) || '' }}
+            --output-format stream-json
+            --mcp-config /tmp/mcp-config.json
+            --settings /tmp/settings.json
+            --allowedTools ${{ steps.config.outputs.allowed_tools }}
+            ${{ steps.plugins.outputs.plugin_dir_args || '' }}
+
+      - name: Commit agent state
+        if: always()
+        env:
+          AGENT_DIR: ${{ steps.config.outputs.agent_dir }}
+          AGENT_NAME: ${{ steps.config.outputs.name }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$AGENT_DIR" ] || [ ! -d "$AGENT_DIR" ]; then
+            echo "No agent directory found, skipping state commit"
+            exit 0
+          fi
+          # Re-establish git credentials (Claude's sandbox may have cleared them)
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Only stage known state files — other files must be committed by the agent
+          state_paths=("$AGENT_DIR/progress.md" "$AGENT_DIR/activity-log.csv" "$AGENT_DIR/inbound/")
+          for path in "${state_paths[@]}"; do
+            git add "$path" 2>/dev/null || true
+          done
+          commit_paths=()
+          while IFS= read -r -d '' path; do
+            commit_paths+=("$path")
+          done < <(git diff --cached --name-only -z -- "${state_paths[@]}")
+          if [ "${#commit_paths[@]}" -gt 0 ]; then
+            git commit -m "Update ${AGENT_NAME} agent state" --only -- "${commit_paths[@]}"
+            # Preserve unrelated in-progress edits while rebasing before push.
+            git pull --rebase --autostash
+            if ! git push 2>&1; then
+              echo "::warning::Direct push failed (likely branch protection). Skipping agent state commit."
+            fi
+          else
+            echo "No agent state changes to commit"
+          fi
+
+      - name: Upload Claude execution output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-execution-output
+          path: /home/runner/work/_temp/claude-execution-output.json
+          if-no-files-found: ignore
+          retention-days: 30
