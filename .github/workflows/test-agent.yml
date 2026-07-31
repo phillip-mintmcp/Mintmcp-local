@@ -1,0 +1,82 @@
+# GENERATED from test-agent/agent.yml — do not edit by hand
+name: Test agent Agent
+
+on:
+  repository_dispatch:
+    types: [test_agent_event]
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Message or instructions for Test agent'
+        required: false
+        type: string
+      model:
+        description: 'Model to use'
+        required: false
+        default: 'sonnet'
+        type: choice
+        options:
+          - sonnet
+          - opus
+          - haiku
+          - fable
+
+concurrency:
+  group: test-agent-${{ github.event.client_payload.thread_ts || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  fast-dispatch:
+    if: github.event_name != 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Dispatch to sandbox
+        run: |
+          OIDC_TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${MINTMCP_BASE_URL}" \
+            | jq -r '.value')
+
+          BODY=$(jq -n \
+            --arg slug "$AGENT_SLUG" \
+            --arg trigger "$TRIGGER_EVENT_ID" \
+            --arg event "$EVENT_NAME" \
+            --arg prompt "$PROMPT_OVERRIDE" \
+            '{agentSlug: $slug, triggerEventId: $trigger, eventName: $event, promptOverride: $prompt}')
+
+          curl -sf -X POST \
+            "${MINTMCP_BASE_URL}/api/agent-dispatch" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY"
+        env:
+          MINTMCP_BASE_URL: https://app.mintmcp.com
+          AGENT_SLUG: test-agent
+          TRIGGER_EVENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          EVENT_NAME: ${{ github.event_name }}
+          PROMPT_OVERRIDE: ${{ github.event.inputs.prompt || '' }}
+
+  run:
+    needs: fast-dispatch
+    if: always() && needs.fast-dispatch.result != 'success'
+    uses: ./.github/workflows/run-agent.yml
+    with:
+      config_path: test-agent/agent.yml
+      event_name: ${{ github.event_name }}
+      event_payload: >-
+        ${{ github.event_name == 'repository_dispatch'
+            && toJson(github.event.client_payload)
+            || github.event_name == 'workflow_dispatch'
+            && toJson(github.event.inputs)
+            || '{}' }}
+      model_override: ${{ github.event.inputs.model || '' }}
+      prompt_override: ${{ github.event.inputs.prompt || '' }}
+    secrets:
+      AGENT_SECRETS_JSON: >-
+        {"CLAUDE_CODE_OAUTH_TOKEN":${{ toJson(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"MINTMCP_ORG_KEY":${{ toJson(secrets.MINTMCP_ORG_KEY) }}}
