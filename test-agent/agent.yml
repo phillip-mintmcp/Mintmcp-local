@@ -30,6 +30,7 @@ runtime:
 secret_keys:
   - SLACK_BOT_TOKEN
   - SLACK_TEAM_ID
+  - VMCP_KEY_SPENCE_TOOLS
 repo_secret_keys:
   - CLAUDE_CODE_OAUTH_TOKEN
 
@@ -42,10 +43,17 @@ mcp_servers:
     env:
       SLACK_BOT_TOKEN: "{{secrets.SLACK_BOT_TOKEN}}"
       SLACK_TEAM_ID: "{{secrets.SLACK_TEAM_ID}}"
+  Spence-tools:
+    type: http
+    url: http://localhost:3000/s/g_3Zz6Relso1ITYuxU2kLxiF/mcp
+    headers:
+      Authorization: Bearer {{secrets.VMCP_KEY_SPENCE_TOOLS}}
 
 sandbox:
   enabled: true
   auto_allow_bash_if_sandboxed: true
+  allowed_domains:
+    - localhost
 
 hooks:
   write_check: true
@@ -72,6 +80,7 @@ allowed_tools:
   - mcp__slack__slack_get_user_profile
   - mcp__slack__slack_upload_file
   - mcp__slack__slack_download_file
+  - mcp__Spence-tools
 
 prompt: |
   You are **Test agent**.
