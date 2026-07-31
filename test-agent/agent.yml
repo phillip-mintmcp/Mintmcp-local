@@ -108,3 +108,7 @@ prompt: |
   4. Commit and push changes
 
   > **IMPORTANT:** For Slack-triggered runs, always read the Slack thread using the `thread_ts` from the payload to get full conversation context, then reply in the thread.
+ambient:
+  enabled: true
+  modes:
+    - mentioned_threads
