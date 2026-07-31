@@ -79,4 +79,4 @@ jobs:
       prompt_override: ${{ github.event.inputs.prompt || '' }}
     secrets:
       AGENT_SECRETS_JSON: >-
-        {"CLAUDE_CODE_OAUTH_TOKEN":${{ toJson(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"MINTMCP_ORG_KEY":${{ toJson(secrets.MINTMCP_ORG_KEY) }}}
+        {"SLACK_BOT_TOKEN":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_BOT_TOKEN) }},"SLACK_TEAM_ID":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_TEAM_ID) }},"CLAUDE_CODE_OAUTH_TOKEN":${{ toJson(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"MINTMCP_ORG_KEY":${{ toJson(secrets.MINTMCP_ORG_KEY) }}}

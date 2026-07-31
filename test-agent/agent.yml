@@ -2,7 +2,6 @@ name: "Test agent"
 slug: "test-agent"
 agent_dir: "test-agent"
 
-
 triggers:
   repository_dispatch: "test_agent_event"
   workflow_dispatch: true
@@ -13,12 +12,12 @@ triggers:
   # schedule:
   #   - "0 13 * * *"  # daily at 13:00 UTC
 
-# Optional: allow classifier-gated ambient replies in threads where this agent
-# has already been mentioned.
-# ambient:
-#   enabled: true
-#   modes:
-#     - mentioned_threads
+  # Optional: allow classifier-gated ambient replies in threads where this agent
+  # has already been mentioned.
+  # ambient:
+  #   enabled: true
+  #   modes:
+  #     - mentioned_threads
 
 concurrency: true
 
@@ -28,12 +27,21 @@ runtime:
   max_turns: 80
   timeout_minutes: 20
 
-
-secret_keys: []
+secret_keys:
+  - SLACK_BOT_TOKEN
+  - SLACK_TEAM_ID
 repo_secret_keys:
   - CLAUDE_CODE_OAUTH_TOKEN
 
-mcp_servers: {}
+mcp_servers:
+  slack:
+    command: npx
+    args:
+      - -y
+      - "@mintmcp/slack-mcp-server"
+    env:
+      SLACK_BOT_TOKEN: "{{secrets.SLACK_BOT_TOKEN}}"
+      SLACK_TEAM_ID: "{{secrets.SLACK_TEAM_ID}}"
 
 sandbox:
   enabled: true
@@ -54,6 +62,16 @@ allowed_tools:
   - Bash
   - Glob
   - Grep
+  - mcp__slack__slack_list_channels
+  - mcp__slack__slack_post_message
+  - mcp__slack__slack_reply_to_thread
+  - mcp__slack__slack_get_channel_history
+  - mcp__slack__slack_get_thread_replies
+  - mcp__slack__slack_add_reaction
+  - mcp__slack__slack_get_users
+  - mcp__slack__slack_get_user_profile
+  - mcp__slack__slack_upload_file
+  - mcp__slack__slack_download_file
 
 prompt: |
   You are **Test agent**.
