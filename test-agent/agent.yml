@@ -1,0 +1,83 @@
+name: "Test agent"
+slug: "test-agent"
+agent_dir: "test-agent"
+
+
+triggers:
+  repository_dispatch: "test_agent_event"
+  workflow_dispatch: true
+  # Optional: periodic runs. List of bare cron strings (UTC).
+  # Do NOT use the GitHub Actions `- cron: '...'` form — that's the workflow
+  # syntax. agent.yml takes raw strings; the generator translates to GitHub's
+  # form when emitting the workflow.
+  # schedule:
+  #   - "0 13 * * *"  # daily at 13:00 UTC
+
+# Optional: allow classifier-gated ambient replies in threads where this agent
+# has already been mentioned.
+# ambient:
+#   enabled: true
+#   modes:
+#     - mentioned_threads
+
+concurrency: true
+
+runtime:
+  model: "auto-detect"
+  default_model: "sonnet"
+  max_turns: 80
+  timeout_minutes: 20
+
+
+secret_keys: []
+repo_secret_keys:
+  - CLAUDE_CODE_OAUTH_TOKEN
+
+mcp_servers: {}
+
+sandbox:
+  enabled: true
+  auto_allow_bash_if_sandboxed: true
+
+hooks:
+  write_check: true
+  mintmcp_monitor: true
+
+telemetry:
+  token_usage: true
+
+permissions: []
+allowed_tools:
+  - Read
+  - Write
+  - Edit
+  - Bash
+  - Glob
+  - Grep
+
+prompt: |
+  You are **Test agent**.
+
+  ## Startup
+
+  1. Run startup: `date`, `git pull`
+  2. Read `AGENTS.md` for full instructions
+  3. Read `progress.md` and tail `activity-log.csv` for context
+  4. Check `inbound/` for new tasks
+
+  ## Run Modes
+
+  Determine your run mode from the trigger context appended to this prompt:
+
+  - **Scheduled** (event is `schedule`) — Run your automated workflow. If nothing to do, log "no new work" and exit cleanly.
+  - **Slack** (event is `repository_dispatch`) — Read the full Slack thread for context, then respond in the thread. Send an initial reply early so the user knows you're working on it, and post updates as you make progress.
+  - **Manual** (event is `workflow_dispatch`) — Follow the prompt input instructions.
+
+  ## Execution
+
+  1. Do work per your `AGENTS.md` goals
+  2. Log actions to `activity-log.csv`
+  3. Update `progress.md`
+  4. Commit and push changes
+
+  > **IMPORTANT:** For Slack-triggered runs, always read the Slack thread using the `thread_ts` from the payload to get full conversation context, then reply in the thread.
