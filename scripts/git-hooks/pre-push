@@ -1,0 +1,122 @@
+#!/bin/bash
+# Agent directory isolation, enforced as a git pre-push hook.
+#
+# Installed by pointing core.hooksPath at scripts/git-hooks in agent
+# checkouts (the sandbox setup script does this). Because git itself
+# invokes this hook with the exact refs being pushed, it works the same
+# for every harness and command shape — compound commands, scripts,
+# anything that shells out to git.
+#
+# Best-effort guard only (git push --no-verify skips it); branch protection
+# and scoped state commits are the authoritative backstop for protected
+# writes on main.
+#
+# Env contract:
+#   MINTMCP_WRITE_CHECK - hook is a no-op unless this is "true"
+#   AGENT_DIR           - agent directory name; no-op when unset (humans)
+#   AGENT_NAME          - display name for error messages (optional)
+#
+# git invokes hooks with: $1 = remote name, $2 = remote URL, and one stdin
+# line per ref being pushed: <local ref> <local sha> <remote ref> <remote sha>
+
+if [ "${MINTMCP_WRITE_CHECK:-}" != "true" ]; then
+  exit 0
+fi
+if [ -z "${AGENT_DIR:-}" ]; then
+  exit 0
+fi
+AGENT_NAME="${AGENT_NAME:-$AGENT_DIR}"
+
+ALLOWED_PATTERNS=(
+  "${AGENT_DIR}/"
+  "*/inbound/"
+)
+
+PROTECTED_PATTERNS=(
+  ".github/workflows/"
+  "AGENTS.md"
+  "CLAUDE.md"
+  "scripts/"
+)
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+changed_files_for_push() {
+  local local_sha="$1" remote_sha="$2"
+  if [ "$remote_sha" = "$ZERO_SHA" ]; then
+    # Creating the remote branch: diff against the merge base with what we
+    # know of origin/main, falling back to everything reachable.
+    git diff --name-only "origin/main...$local_sha" 2>/dev/null && return 0
+    git ls-tree -r --name-only "$local_sha" 2>/dev/null
+    return 0
+  fi
+  git diff --name-only "$remote_sha..$local_sha" 2>/dev/null && return 0
+  # remote sha not available locally (stale tracking info) — fall back.
+  git diff --name-only "origin/main...$local_sha" 2>/dev/null
+}
+
+BLOCKED_FILES=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "$local_ref" ] && continue
+  # Only pushes to main are guarded; branches feed PRs, which are reviewed.
+  [ "$remote_ref" != "refs/heads/main" ] && continue
+  # Deleting the remote ref pushes no content.
+  [ "$local_sha" = "$ZERO_SHA" ] && continue
+
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    IS_ALLOWED=false
+    IS_PROTECTED=false
+
+    for pattern in "${PROTECTED_PATTERNS[@]}"; do
+      if [[ "$file" == $pattern* ]] || [[ "$file" == *"/$pattern"* ]]; then
+        IS_PROTECTED=true
+        break
+      fi
+    done
+
+    for pattern in "${ALLOWED_PATTERNS[@]}"; do
+      if [[ "$file" == $pattern* ]]; then
+        # But skip instruction files, which require PRs
+        if [[ "$file" == *"CLAUDE.md" || "$file" == *"AGENTS.md" ]]; then
+          IS_PROTECTED=true
+        else
+          IS_ALLOWED=true
+        fi
+        break
+      fi
+    done
+
+    if [ "$IS_PROTECTED" = true ] || [ "$IS_ALLOWED" = false ]; then
+      BLOCKED_FILES+=("$file")
+    fi
+  done <<< "$(changed_files_for_push "$local_sha" "$remote_sha")"
+done
+
+if [ "${#BLOCKED_FILES[@]}" -gt 0 ]; then
+  {
+    printf 'ERROR: %s cannot push these files directly to main!\n' "$AGENT_NAME"
+    printf '\n'
+    printf '%s\n' "Blocked files:"
+    for file in "${BLOCKED_FILES[@]}"; do
+      printf '  - %s\n' "$file"
+    done
+    printf '\n'
+    printf '%s can only write to:\n' "$AGENT_NAME"
+    printf '  - %s/ (except CLAUDE.md and AGENTS.md)\n' "$AGENT_DIR"
+    printf '%s\n' "  - */inbound/ (inter-agent messages)"
+    printf '\n'
+    printf '%s\n' "For other changes, create a PR instead:"
+    printf '  1. git checkout -b %s/<description>\n' "$AGENT_DIR"
+    printf '%s\n' "  2. git push -u origin <branch>"
+    printf '%s\n' "  3. gh pr create"
+    printf '\n'
+    printf '%s\n' "Do NOT work around this check (--no-verify, editing the"
+    printf '%s\n' "hook, pushing via the API, etc.). The PR exists so a human"
+    printf '%s\n' "can review this change: do not merge it yourself — stop"
+    printf '%s\n' "after creating the PR and wait for a human to review."
+  } >&2
+  exit 1
+fi
+
+exit 0
