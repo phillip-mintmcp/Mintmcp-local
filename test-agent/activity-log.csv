@@ -2,3 +2,5 @@ timestamp,action,type,details
 2026-07-31T22:25:39Z,slack_reply,communication,"Bare mention from U07KS9K1YKD in C0BM6NCHALD thread 1785536726.380659 with no task text; replied asking what they need help with"
 2026-07-31T23:19:00Z,slack_reply,communication,"Replied in thread 1785536726.380659 to Deepwiki lookup request: no Deepwiki tool/MCP connected, offered web search/fetch as alternative"
 2026-07-31T23:52:17Z,slack_reply,communication,"Thread 1785536726.380659: user requested daily hello+joke schedule at self-contradictory 'morning at five 5pm' time; asked for clarification on time and timezone before implementing"
+2026-08-01T00:12:00Z,slack_reply,communication,"Thread 1785543056.910239: user asked what the agent can do; replied with capabilities summary and noted AGENTS.md goals are still placeholder"
+2026-08-01T00:14:30Z,created_pr,maintenance,"Opened PR #1 (test-agent/expand-goals-connector-testing) adding connector-testing goal and a per-connector-request constraint to AGENTS.md, in response to Slack request in thread 1785543056.910239"
