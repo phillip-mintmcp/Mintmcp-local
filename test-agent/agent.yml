@@ -33,6 +33,7 @@ secret_keys:
   - VMCP_KEY_SPENCE_TOOLS
   - VMCP_KEY_DEEPWIKI
   - VMCP_KEY_GOOGLE_CALENDAR
+  - VMCP_KEY_GSUITE
 repo_secret_keys:
   - CLAUDE_CODE_OAUTH_TOKEN
 
@@ -60,6 +61,11 @@ mcp_servers:
     url: http://localhost:3000/s/g_6UL8ZlZIYw8ayHRgzry5rz/mcp
     headers:
       Authorization: Bearer {{secrets.VMCP_KEY_GOOGLE_CALENDAR}}
+  GSuite:
+    type: http
+    url: http://localhost:3000/s/g_6L6lOeVyoTGEtbZYajafnz/mcp
+    headers:
+      Authorization: Bearer {{secrets.VMCP_KEY_GSUITE}}
 
 sandbox:
   enabled: true
@@ -95,6 +101,7 @@ allowed_tools:
   - mcp__Spence-tools
   - mcp__DeepWiki
   - mcp__Google-Calendar
+  - mcp__GSuite
 
 prompt: |
   You are **Test agent**.
