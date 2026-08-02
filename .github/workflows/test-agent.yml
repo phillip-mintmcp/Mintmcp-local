@@ -79,4 +79,4 @@ jobs:
       prompt_override: ${{ github.event.inputs.prompt || '' }}
     secrets:
       AGENT_SECRETS_JSON: >-
-        {"SLACK_BOT_TOKEN":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_BOT_TOKEN) }},"SLACK_TEAM_ID":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_TEAM_ID) }},"VMCP_KEY_SPENCE_TOOLS":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_SPENCE_TOOLS) }},"VMCP_KEY_DEEPWIKI":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_DEEPWIKI) }},"CLAUDE_CODE_OAUTH_TOKEN":${{ toJson(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"MINTMCP_ORG_KEY":${{ toJson(secrets.MINTMCP_ORG_KEY) }}}
+        {"SLACK_BOT_TOKEN":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_BOT_TOKEN) }},"SLACK_TEAM_ID":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_TEAM_ID) }},"VMCP_KEY_SPENCE_TOOLS":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_SPENCE_TOOLS) }},"VMCP_KEY_DEEPWIKI":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_DEEPWIKI) }},"VMCP_KEY_GOOGLE_CALENDAR":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_GOOGLE_CALENDAR) }},"CLAUDE_CODE_OAUTH_TOKEN":${{ toJson(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"MINTMCP_ORG_KEY":${{ toJson(secrets.MINTMCP_ORG_KEY) }}}
