@@ -133,3 +133,5 @@ ambient:
   enabled: true
   modes:
     - mentioned_threads
+codex:
+  enabled: true
