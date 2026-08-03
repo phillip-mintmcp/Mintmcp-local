@@ -74,7 +74,7 @@ sandbox:
     - localhost
 
 hooks:
-  write_check: true
+  write_check: false
   mintmcp_monitor: true
 
 telemetry:
