@@ -26,13 +26,10 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
-  pull-requests: write
   id-token: write
 
 jobs:
   fast-dispatch:
-    if: github.event_name != 'repository_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -48,9 +45,22 @@ jobs:
             --arg trigger "$TRIGGER_EVENT_ID" \
             --arg event "$EVENT_NAME" \
             --arg prompt "$PROMPT_OVERRIDE" \
-            '{agentSlug: $slug, triggerEventId: $trigger, eventName: $event, promptOverride: $prompt}')
+            --argjson payload "$EVENT_PAYLOAD" \
+            '{
+              agentSlug: $slug,
+              triggerEventId: $trigger,
+              eventName: $event,
+              promptOverride: $prompt,
+              eventPayload: (
+                if $event == "repository_dispatch" then
+                  $payload
+                else
+                  $payload + {source: "api"}
+                end
+              )
+            }')
 
-          curl -sf -X POST \
+          curl -sf --retry 3 --retry-connrefused --retry-delay 2 -X POST \
             "${MINTMCP_BASE_URL}/api/agent-dispatch" \
             -H "Authorization: Bearer $OIDC_TOKEN" \
             -H "Content-Type: application/json" \
@@ -60,23 +70,9 @@ jobs:
           AGENT_SLUG: test-agent
           TRIGGER_EVENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           EVENT_NAME: ${{ github.event_name }}
-          PROMPT_OVERRIDE: ${{ github.event.inputs.prompt || '' }}
-
-  run:
-    needs: fast-dispatch
-    if: always() && needs.fast-dispatch.result != 'success'
-    uses: ./.github/workflows/run-agent.yml
-    with:
-      config_path: test-agent/agent.yml
-      event_name: ${{ github.event_name }}
-      event_payload: >-
-        ${{ github.event_name == 'repository_dispatch'
+          EVENT_PAYLOAD: ${{ github.event_name == 'repository_dispatch'
             && toJson(github.event.client_payload)
             || github.event_name == 'workflow_dispatch'
             && toJson(github.event.inputs)
             || '{}' }}
-      model_override: ${{ github.event.inputs.model || '' }}
-      prompt_override: ${{ github.event.inputs.prompt || '' }}
-    secrets:
-      AGENT_SECRETS_JSON: >-
-        {"SLACK_BOT_TOKEN":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_BOT_TOKEN) }},"SLACK_TEAM_ID":${{ toJson(secrets.AGENT_TEST_AGENT__SLACK_TEAM_ID) }},"VMCP_KEY_SPENCE_TOOLS":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_SPENCE_TOOLS) }},"VMCP_KEY_DEEPWIKI":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_DEEPWIKI) }},"VMCP_KEY_GOOGLE_CALENDAR":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_GOOGLE_CALENDAR) }},"VMCP_KEY_GSUITE":${{ toJson(secrets.AGENT_TEST_AGENT__VMCP_KEY_GSUITE) }},"CLAUDE_CODE_OAUTH_TOKEN":${{ toJson(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"MINTMCP_ORG_KEY":${{ toJson(secrets.MINTMCP_ORG_KEY) }}}
+          PROMPT_OVERRIDE: ${{ github.event.inputs.prompt || '' }}
